@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-# Copyright (c) 2013-2014 Abram Hindle
+# Copyright (c) 2013-2014 Abram Hindle, Tsung Lin Yong
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -14,16 +14,18 @@
 # limitations under the License.
 #
 import flask
-from flask import Flask, request
+from flask import Flask, request, redirect
 from flask_sockets import Sockets
 import gevent
 from gevent import queue
 import time
 import json
+import collections
 import os
 
 app = Flask(__name__)
 sockets = Sockets(app)
+clients = []
 app.debug = True
 
 class World:
@@ -31,7 +33,7 @@ class World:
         self.clear()
         # we've got listeners now!
         self.listeners = list()
-        
+
     def add_set_listener(self, listener):
         self.listeners.append( listener )
 
@@ -55,34 +57,89 @@ class World:
 
     def get(self, entity):
         return self.space.get(entity,dict())
-    
+
     def world(self):
         return self.space
 
-myWorld = World()        
+# Client class taken from
+# https://github.com/abramhindle/WebSocketsExamples/blob/master/chat.py
+class Client:
+    def __init__(self):
+        self.queue = queue.Queue()
+
+    def put(self, v):
+        self.queue.put_nowait(v)
+
+    def get(self):
+        return self.queue.get()
+
+myWorld = World()
 
 def set_listener( entity, data ):
     ''' do something with the update ! '''
+    for client in clients:
+        client.put(json.dumps({entity: data}))
 
 myWorld.add_set_listener( set_listener )
-        
+
+# From http://stackoverflow.com/questions/1254454/fastest-way-to-convert-a-dicts-keys-values-from-unicode-to-str
+def convert(data):
+    if isinstance(data, basestring):
+        return str(data)
+    elif isinstance(data, collections.Mapping):
+        return dict(map(convert, data.iteritems()))
+    elif isinstance(data, collections.Iterable):
+        return type(data)(map(convert, data))
+    else:
+        return data
+
 @app.route('/')
 def hello():
     '''Return something coherent here.. perhaps redirect to /static/index.html '''
-    return None
+    return redirect("/static/index.html", code=302)
 
-def read_ws(ws,client):
+def read_ws(ws):
     '''A greenlet function that reads from the websocket and updates the world'''
-    # XXX: TODO IMPLEMENT ME
+    try:
+        while True:
+            msg = ws.receive()
+            if (msg is not None):
+                jsonMsg = json.loads(msg)
+                entity = jsonMsg.keys()[0]
+                myWorld.set(entity, jsonMsg[entity])
+            else:
+                break
+    except Exception as e:
+        print "read exception: %s" % e.strerror
+
     return None
 
 @sockets.route('/subscribe')
 def subscribe_socket(ws):
     '''Fufill the websocket URL of /subscribe, every update notify the
        websocket and read updates from the websocket '''
-    # XXX: TODO IMPLEMENT ME
-    return None
+    client = Client()
+    clients.append(client)
 
+    ws.send(str(convert(myWorld.world())).replace("'", '"'))
+    g = gevent.spawn(read_ws, ws)
+
+    try:
+        closeConnection = False
+        while not closeConnection:
+            msg = client.get()
+
+            if msg is None:
+                closeConnection = True
+            else:
+                ws.send(msg)
+    except Exception as e:
+        print "WS Error %s" % e
+    finally:
+        clients.remove(client)
+        gevent.kill(g)
+
+    return None
 
 def flask_post_json():
     '''Ah the joys of frameworks! They do so much work for you
@@ -97,23 +154,40 @@ def flask_post_json():
 @app.route("/entity/<entity>", methods=['POST','PUT'])
 def update(entity):
     '''update the entities via this interface'''
-    return None
+    if request.method == "POST" or request.method == "PUT":
+        data = flask_post_json()
+        if data != {}:
+            myWorld.set(entity, data)
+            return str(convert(data)).replace("'", '"')
 
-@app.route("/world", methods=['POST','GET'])    
+    return "{}"
+
+@app.route("/world", methods=['POST','GET'])
 def world():
     '''you should probably return the world here'''
-    return None
+    if request.method == "POST":
+        data = flask_post_json()
 
-@app.route("/entity/<entity>")    
+    if myWorld.world() != {}:
+        return str(convert(myWorld.world())).replace("'", '"')
+
+    return "{}"
+
+@app.route("/entity/<entity>")
 def get_entity(entity):
     '''This is the GET version of the entity interface, return a representation of the entity'''
-    return None
+    jsonEntity = myWorld.world().get(entity)
+    if jsonEntity is not None:
+        return str(convert(jsonEntity)).replace("'", '"')
+
+    return "{}"
 
 
 @app.route("/clear", methods=['POST','GET'])
 def clear():
     '''Clear the world out!'''
-    return None
+    myWorld.world().clear()
+    return "{}"
 
 
 
